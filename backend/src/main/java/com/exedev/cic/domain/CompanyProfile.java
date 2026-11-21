@@ -94,11 +94,18 @@ public class CompanyProfile {
         this.updatedAt = this.createdAt;
     }
 
+    private static final BigDecimal MIN_SCORE = BigDecimal.ONE;
+    private static final BigDecimal MAX_SCORE = new BigDecimal("5.00");
+
     /**
-     * Domain invariant: recomputes weighted sliding averages in O(1) without loading
-     * historical review collections into memory (prevents OOM and N+1 queries).
+     * Recomputes sliding weighted averages in O(1) without loading historical
+     * review rows into memory. Enforces [1.00, 5.00] score invariants.
      */
     public void recordNewReviewScore(BigDecimal rating, BigDecimal culture, BigDecimal compensation) {
+        validateScore("rating", rating);
+        validateScore("culture", culture);
+        validateScore("compensation", compensation);
+
         BigDecimal currentCount = BigDecimal.valueOf(this.reviewCount);
         BigDecimal nextCount = BigDecimal.valueOf(this.reviewCount + 1L);
 
@@ -116,6 +123,25 @@ public class CompanyProfile {
 
         this.reviewCount += 1;
         this.updatedAt = Instant.now();
+    }
+
+    private static void validateScore(String field, BigDecimal score) {
+        Objects.requireNonNull(score, field + " must not be null");
+        if (score.compareTo(MIN_SCORE) < 0 || score.compareTo(MAX_SCORE) > 0) {
+            throw new IllegalArgumentException(field + " must be between 1.00 and 5.00");
+        }
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof CompanyProfile other)) return false;
+        return id != null && id.equals(other.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return getClass().hashCode();
     }
 
     public UUID getId() { return id; }

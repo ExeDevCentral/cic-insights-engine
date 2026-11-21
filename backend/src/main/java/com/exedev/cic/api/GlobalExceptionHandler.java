@@ -1,9 +1,10 @@
 package com.exedev.cic.api;
 
-import jakarta.persistence.EntityNotFoundException;
+import com.exedev.cic.domain.CompanyNotFoundException;
 import jakarta.persistence.OptimisticLockException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -14,17 +15,24 @@ import java.time.Instant;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-/**
- * RFC 7807 Problem Details global exception handler.
- */
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
-    @ExceptionHandler(EntityNotFoundException.class)
-    public ProblemDetail handleNotFound(EntityNotFoundException ex) {
+    @ExceptionHandler(CompanyNotFoundException.class)
+    public ProblemDetail handleNotFound(CompanyNotFoundException ex) {
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
         problem.setTitle("Resource Not Found");
         problem.setType(URI.create("https://api.exedev.com/errors/not-found"));
+        problem.setProperty("slug", ex.getSlug());
+        problem.setProperty("timestamp", Instant.now());
+        return problem;
+    }
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ProblemDetail handleInvalidParameter(IllegalArgumentException ex) {
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, ex.getMessage());
+        problem.setTitle("Invalid Query Parameter");
+        problem.setType(URI.create("https://api.exedev.com/errors/invalid-parameter"));
         problem.setProperty("timestamp", Instant.now());
         return problem;
     }
@@ -49,11 +57,11 @@ public class GlobalExceptionHandler {
         return problem;
     }
 
-    @ExceptionHandler(OptimisticLockException.class)
-    public ProblemDetail handleOptimisticLock(OptimisticLockException ex) {
+    @ExceptionHandler({OptimisticLockException.class, ObjectOptimisticLockingFailureException.class})
+    public ProblemDetail handleOptimisticLock(Exception ex) {
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(
                 HttpStatus.CONFLICT,
-                "Concurrent modification detected on CompanyProfile. Please retry."
+                "Concurrent modification detected on CompanyProfile. Retry the request."
         );
         problem.setTitle("Concurrent Update Conflict");
         problem.setType(URI.create("https://api.exedev.com/errors/concurrency-conflict"));

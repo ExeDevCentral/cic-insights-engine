@@ -53,3 +53,8 @@ management:
   metrics:
     tags:
       application: ${spring.application.name}
+
+cic:
+  canonical-base-url: ${CIC_CANONICAL_BASE_URL:https://insights.exedev.com/companies/}
+  max-page-size: 50
+  default-suggest-limit: 8

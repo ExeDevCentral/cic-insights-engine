@@ -1,72 +1,89 @@
-# CIC Insights Engine — Employer Branding & SEO Telemetry Platform
+# cic-insights-engine
 
-> **Stack:** Java 21 (Virtual Threads) • Spring Boot 3.4 • Spring Data JPA (Hibernate 6) • Flyway • PostgreSQL 16 • Caffeine Cache • RFC 7807 ProblemDetails • React 19 • TypeScript 5 • TanStack React Query • Tailwind CSS
+Backend-first company insights, search, and employer reputation service built with **Java 21**, **Spring Boot 3.4**, **PostgreSQL 16**, **Flyway**, and a lightweight **React 19 / TypeScript** client.
 
-Enterprise full-stack architecture modeled after **Company Insights & Connections (CIC)** systems supporting high-traffic employer branding pages, verified employee reviews, and automated Schema.org (`EmployerAggregateRating`) JSON-LD SEO structured data generation.
+The service models a read-heavy company directory (employer profiles, search/facets, typeahead suggestions, employee reviews, and Schema.org `EmployerAggregateRating` JSON-LD output) where profile reads outnumber review writes by orders of magnitude.
 
----
+## Stack
 
-## 🏛️ Architectural Highlights (Why This isn't Junior Code)
+- **Backend:** Java 21 (Virtual Threads), Spring Boot 3.4, Spring Data JPA (Hibernate 6), Flyway, Caffeine, Micrometer / Prometheus, Springdoc OpenAPI 3
+- **Database:** PostgreSQL 16 (docker-compose included)
+- **Frontend:** React 19, TypeScript 5, Vite, TanStack Query
 
-1. **Java 21 Virtual Threads (`spring.threads.virtual.enabled=true`):**
-   High-concurrency non-blocking I/O throughput for database and cache reads without reactive callback complexity.
-2. **Zero N+1 & $O(1)$ Domain Invariants (`CompanyProfile#recordNewReviewScore`):**
-   Instead of loading `List<EmployerReview>` via `@OneToMany` (a classic junior anti-pattern that triggers `OutOfMemoryError` on popular companies), the aggregate root computes sliding weighted averages in $O(1)$ time with `BigDecimal` (`RoundingMode.HALF_UP`) and enforces concurrency safety with JPA `@Version` optimistic locking.
-3. **Production JPA Posture (`open-in-view: false` & `ddl-auto: validate`):**
-   OSIV is explicitly disabled to prevent database connections from being held across HTTP view rendering. All schema evolution is deterministically versioned via **Flyway** (`V1__init_company_insights_schema.sql`) with composite B-Tree indexes (`idx_company_profiles_industry_rating`).
-4. **RFC 7807 Problem Details (`GlobalExceptionHandler`):**
-   Standardized machine-readable HTTP error responses (`application/problem+json`) for validation failures (`400`), missing slugs (`404`), and optimistic lock conflicts (`409`).
-5. **SEO Structured Data & Low-Latency Caching:**
-   Every company profile response dynamically synthesizes Schema.org `EmployerAggregateRating` JSON-LD for search engine rich snippets, backed by an in-memory **Caffeine** cache (`@Cacheable` / `@CacheEvict`) and **Micrometer Prometheus** telemetry.
+## Key Design Decisions
 
----
+Rather than treating this as a generic CRUD demo, the codebase focuses on a few concrete production concerns:
 
-## 📂 Project Structure
+1. **Composable Search & Safe Sorting (`CompanySearchCriteria`, `CompanySpecifications`):**
+   - Multi-field filtering (`industry`, `minRating`, `verifiedOnly`, `headquarters`, `minActiveJobs`, tokenized `q`) built with Spring Data `Specification<CompanyProfile>` so Hibernate only emits active predicates.
+   - User-supplied `LIKE` wildcards (`%`, `_`, `\`) are escaped explicitly.
+   - Sort fields are validated against an explicit allowlist and page size is clamped (`cic.max-page-size`) before reaching JPA, preventing arbitrary property-path errors or unbounded page requests.
+   - Prefix-prioritized typeahead (`/api/v1/companies/suggest`) and cached global facets (`/api/v1/companies/facets`) support fast search UIs.
 
-```text
-cic-insights-engine/
-├── backend/
-│   ├── pom.xml
-│   └── src/
-│       ├── main/
-│       │   ├── java/com/exedev/cic/
-│       │   │   ├── CicInsightsApplication.java
-│       │   │   ├── api/
-│       │   │   │   ├── CompanyInsightsController.java
-│       │   │   │   ├── GlobalExceptionHandler.java
-│       │   │   │   └── dto/
-│       │   │   │       ├── CompanyInsightDto.java
-│       │   │   │       └── SubmitReviewRequest.java
-│       │   │   ├── domain/
-│       │   │   │   ├── CompanyProfile.java
-│       │   │   │   └── EmployerReview.java
-│       │   │   ├── repository/
-│       │   │   │   ├── CompanyProfileRepository.java
-│       │   │   │   └── EmployerReviewRepository.java
-│       │   │   └── service/
-│       │   │       └── CompanyInsightsService.java
-│       │   └── resources/
-│       │       ├── application.yml
-│       │       └── db/migration/
-│       │           └── V1__init_company_insights_schema.sql
-│       └── test/
-│           └── java/com/exedev/cic/domain/
-│               └── CompanyProfileTest.java
-└── frontend/
-    └── src/
-        └── CompanyInsightsDashboard.tsx
+2. **Constant-Time Score Aggregation with Optimistic Locking (`CompanyProfile`):**
+   - Reviews are stored in `employer_reviews` without a `@OneToMany` collection on `CompanyProfile`.
+   - Submitting a review updates sliding averages (`overallRating`, `cultureScore`, `compensationScore`) in O(1) using `BigDecimal` (`RoundingMode.HALF_UP`) and relies on JPA `@Version` optimistic locking.
+   - Concurrent update conflicts (`ObjectOptimisticLockingFailureException` / `OptimisticLockException`) map cleanly to HTTP `409 Conflict` via RFC 7807 `ProblemDetail`.
+   - Details and trade-offs (including rounding drift and reconciliation) are documented in [ADR-0001](docs/adr/0001-sliding-aggregates-and-optimistic-locking.md).
+
+3. **Explicit JPA & Caching Posture:**
+   - `spring.jpa.open-in-view=false` and `ddl-auto=validate`; schema changes live exclusively in Flyway migrations (`backend/src/main/resources/db/migration/`).
+   - Named Caffeine caches (`companyBySlug`, `companyFacets`) with `.recordStats()` exposed via `/actuator/prometheus`, evicted atomically when a new review is recorded.
+   - Typed configuration via `@ConfigurationProperties` (`CicProperties`) instead of hardcoded URLs or magic numbers.
+
+See [docs/adr/](docs/adr/) for the full architecture notes and trade-offs.
+
+## API Overview
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/api/v1/companies` | Dynamic multi-criteria search (`industry`, `minRating`, `verifiedOnly`, `headquarters`, `minActiveJobs`, `q`, `page`, `size`, `sort`) |
+| `GET` | `/api/v1/companies/suggest?q=ac&limit=8` | Prefix-ranked autocomplete suggestions |
+| `GET` | `/api/v1/companies/facets` | Cached industry counts and global summary |
+| `GET` | `/api/v1/companies/{slug}` | Single company profile + Schema.org JSON-LD |
+| `POST` | `/api/v1/companies/{slug}/reviews` | Submit review and recompute aggregate ratings |
+
+### Quick `curl` Examples
+
+```bash
+# Search verified cloud companies rated >= 4.2 sorted by rating
+curl "http://localhost:8080/api/v1/companies?industry=Cloud&minRating=4.2&verifiedOnly=true&sort=overallRating,desc"
+
+# Autocomplete suggestions
+curl "http://localhost:8080/api/v1/companies/suggest?q=in&limit=5"
+
+# Search facets
+curl "http://localhost:8080/api/v1/companies/facets"
 ```
 
----
+## Running Locally
 
-## 🚀 Running Locally
+### Start PostgreSQL
+```bash
+docker compose up -d
+```
 
-### 1. Backend (Spring Boot 3 + Java 21)
+### Run Backend Tests & App (Java 21 + Maven 3.9+)
 ```bash
 cd backend
 mvn clean test
 mvn spring-boot:run
 ```
-- **REST API:** `http://localhost:8080/api/v1/companies`
-- **Swagger UI (OpenAPI 3):** `http://localhost:8080/swagger-ui.html`
-- **Actuator Health & Prometheus Metrics:** `http://localhost:8080/actuator/health`
+
+Useful local URLs once running:
+- API base: `http://localhost:8080/api/v1/companies`
+- OpenAPI / Swagger UI: `http://localhost:8080/swagger-ui.html`
+- Actuator & Prometheus: `http://localhost:8080/actuator/health`, `http://localhost:8080/actuator/prometheus`
+
+### Run Frontend
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+## Known Limitations & Next Steps
+
+- **Full-text ranking at scale:** `Specification` + `LOWER(...) LIKE` is clean and portable up to tens of thousands of company rows. Beyond that, moving `q` matching to PostgreSQL `tsvector` + GIN trigram indexes (`pg_trgm`) or OpenSearch is the natural next step (see [ADR-0002](docs/adr/0002-composable-search-and-sort-allowlist.md)).
+- **Periodic aggregate reconciliation:** Running averages can accumulate minor `HALF_UP` rounding drift after thousands of writes; a scheduled reconciliation job recomputing aggregates from `employer_reviews` would keep long-lived profiles exact.
+- **Distributed caching:** Caffeine is process-local. Multi-replica deployments should swap to Redis (or L1 Caffeine + L2 Redis) with pub/sub invalidation.

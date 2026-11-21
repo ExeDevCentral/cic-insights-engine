@@ -1,21 +1,32 @@
 package com.exedev.cic.service;
 
 import com.exedev.cic.api.dto.CompanyInsightDto;
+import com.exedev.cic.api.dto.CompanySuggestionDto;
+import com.exedev.cic.api.dto.SearchFacetsDto;
 import com.exedev.cic.api.dto.SubmitReviewRequest;
+import com.exedev.cic.config.CacheConfig;
+import com.exedev.cic.config.CicProperties;
+import com.exedev.cic.domain.CompanyNotFoundException;
 import com.exedev.cic.domain.CompanyProfile;
 import com.exedev.cic.domain.EmployerReview;
 import com.exedev.cic.repository.CompanyProfileRepository;
 import com.exedev.cic.repository.EmployerReviewRepository;
-import jakarta.persistence.EntityNotFoundException;
+import com.exedev.cic.search.CompanySearchCriteria;
+import com.exedev.cic.search.CompanySpecifications;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.cache.annotation.Caching;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 
@@ -24,39 +35,71 @@ public class CompanyInsightsService {
 
     private final CompanyProfileRepository companyRepository;
     private final EmployerReviewRepository reviewRepository;
+    private final CicProperties properties;
 
     public CompanyInsightsService(
             CompanyProfileRepository companyRepository,
-            EmployerReviewRepository reviewRepository
+            EmployerReviewRepository reviewRepository,
+            CicProperties properties
     ) {
         this.companyRepository = companyRepository;
         this.reviewRepository = reviewRepository;
+        this.properties = properties;
     }
 
     @Transactional(readOnly = true)
-    public Page<CompanyInsightDto> searchCompanies(
-            String industry,
-            BigDecimal minRating,
-            String query,
-            Pageable pageable
-    ) {
-        return companyRepository.searchCompanies(industry, minRating, query, pageable)
+    public Page<CompanyInsightDto> searchCompanies(CompanySearchCriteria criteria, Pageable pageable) {
+        Pageable safePageable = CompanySearchCriteria.sanitizePageable(pageable, properties.maxPageSize());
+        return companyRepository.findAll(CompanySpecifications.fromCriteria(criteria), safePageable)
                 .map(this::toInsightDto);
     }
 
     @Transactional(readOnly = true)
-    @Cacheable(value = "companyBySlug", key = "#slug.toLowerCase()")
+    public List<CompanySuggestionDto> suggestCompanies(String rawQuery, Integer requestedLimit) {
+        if (rawQuery == null || rawQuery.trim().length() < 2) {
+            return List.of();
+        }
+        int limit = requestedLimit == null
+                ? properties.defaultSuggestLimit()
+                : Math.min(Math.max(1, requestedLimit), 20);
+        String sanitized = CompanySearchCriteria.escapeLikePattern(rawQuery.trim().toLowerCase(Locale.ROOT));
+        return companyRepository.findSuggestions(sanitized, PageRequest.of(0, limit));
+    }
+
+    @Transactional(readOnly = true)
+    @Cacheable(value = CacheConfig.COMPANY_FACETS_CACHE, key = "'global'")
+    public SearchFacetsDto getSearchFacets() {
+        long total = companyRepository.count();
+        long verified = companyRepository.countByVerifiedEmployerTrue();
+        BigDecimal avg = companyRepository.findAverageOverallRating();
+        BigDecimal scaledAvg = (avg == null ? BigDecimal.ZERO : avg).setScale(2, RoundingMode.HALF_UP);
+
+        Map<String, Long> byIndustry = new LinkedHashMap<>();
+        for (var row : companyRepository.countGroupedByIndustry()) {
+            byIndustry.put(row.getIndustry(), row.getCompanyCount());
+        }
+
+        return new SearchFacetsDto(total, verified, scaledAvg, byIndustry);
+    }
+
+    @Transactional(readOnly = true)
+    @Cacheable(value = CacheConfig.COMPANY_BY_SLUG_CACHE, key = "#slug.toLowerCase()")
     public CompanyInsightDto getBySlug(String slug) {
-        CompanyProfile company = companyRepository.findBySlug(slug.toLowerCase())
-                .orElseThrow(() -> new EntityNotFoundException("Company not found for slug: " + slug));
+        String normalized = slug.toLowerCase(Locale.ROOT);
+        CompanyProfile company = companyRepository.findBySlug(normalized)
+                .orElseThrow(() -> new CompanyNotFoundException(normalized));
         return toInsightDto(company);
     }
 
     @Transactional
-    @CacheEvict(value = "companyBySlug", key = "#slug.toLowerCase()")
+    @Caching(evict = {
+            @CacheEvict(value = CacheConfig.COMPANY_BY_SLUG_CACHE, key = "#slug.toLowerCase()"),
+            @CacheEvict(value = CacheConfig.COMPANY_FACETS_CACHE, allEntries = true)
+    })
     public CompanyInsightDto submitReview(String slug, SubmitReviewRequest request) {
-        CompanyProfile company = companyRepository.findBySlug(slug.toLowerCase())
-                .orElseThrow(() -> new EntityNotFoundException("Company not found for slug: " + slug));
+        String normalized = slug.toLowerCase(Locale.ROOT);
+        CompanyProfile company = companyRepository.findBySlug(normalized)
+                .orElseThrow(() -> new CompanyNotFoundException(normalized));
 
         EmployerReview review = new EmployerReview(
                 UUID.randomUUID(),
@@ -81,9 +124,6 @@ public class CompanyInsightsService {
         return toInsightDto(saved);
     }
 
-    /**
-     * Builds Schema.org EmployerAggregateRating JSON-LD payload for SEO marketing crawlers.
-     */
     private CompanyInsightDto toInsightDto(CompanyProfile c) {
         Map<String, Object> jsonLd = new LinkedHashMap<>();
         jsonLd.put("@context", "https://schema.org");
@@ -92,7 +132,7 @@ public class CompanyInsightsService {
                 "@type", "Organization",
                 "name", c.getDisplayName(),
                 "address", c.getHeadquarters(),
-                "sameAs", "https://indeed.com/cmp/" + c.getSlug()
+                "sameAs", properties.canonicalBaseUrl() + c.getSlug()
         ));
         jsonLd.put("ratingValue", c.getOverallRating());
         jsonLd.put("bestRating", 5);
